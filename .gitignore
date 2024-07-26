@@ -58,3 +58,4 @@ doc/naturaldocs/conf/*/Data/*.nd
 examples/dump
 examples/fadot
 .settings
+.diffchanges
