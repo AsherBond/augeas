@@ -31,6 +31,8 @@
 #include "regexp.h"
 #include "errcode.h"
 
+#define MAX_EXPR_DEPTH 100
+
 static const char *const errcodes[] = {
     "no error",
     "empty name",
@@ -274,6 +276,9 @@ struct state {
      * we need to evaluate the filter twice. The has_else flag
      * means we don't do this unless we really need to */
     bool                 has_else;
+    /* Current nesting depth of parse_expr, used to prevent stack
+     * overflow on deeply nested parentheses */
+    int                  expr_depth;
 };
 
 /* We consider NULL and the empty string to be equal */
@@ -1010,16 +1015,16 @@ static void eval_else(struct state *state, struct expr *expr, struct locpath_tra
         int discard_maxns=0;
         struct nodeset **discard_ns=NULL;
         struct locpath_trace *lpt = state->locpath_trace;
-        value_ind_t vind = make_value(T_NODESET, state);
+        value_ind_t vind;
         if (l->nodeset->used >0 || expr->left_matched) {
             expr->left_matched = 1;
-            state->value_pool[vind].nodeset = clone_nodeset(l->nodeset, state);
+            vind = l - state->value_pool;
             if( lpt_right != NULL ) {
                 discard_maxns = lpt_right->maxns;
                 discard_ns    = lpt_right->ns;
             }
         } else {
-            state->value_pool[vind].nodeset = clone_nodeset(r->nodeset, state);
+            vind = r - state->value_pool;
             if( lpt != NULL && lpt_right != NULL ) {
                 discard_maxns = lpt->maxns;
                 discard_ns    = lpt->ns;
@@ -1506,6 +1511,7 @@ static void eval_expr(struct expr *expr, struct state *state) {
         break;
     case E_APP:
         eval_app(expr, state);
+        RET_ON_ERROR;
         if (expr->fold) {
             /* Do constant folding: replace the function application with
              * a reference to the value that resulted from evaluating it */
@@ -2579,7 +2585,13 @@ static void parse_else_expr(struct state *state) {
  */
 static void parse_expr(struct state *state) {
     skipws(state);
+    if (state->expr_depth >= MAX_EXPR_DEPTH) {
+        STATE_ERROR(state, PATHX_EPAREN);
+        return;
+    }
+    state->expr_depth += 1;
     parse_else_expr(state);
+    state->expr_depth -= 1;
 }
 
 static void store_error(struct pathx *pathx) {
@@ -2665,6 +2677,7 @@ int pathx_parse(const struct tree *tree,
     state->symtab = symtab;
     state->root_ctx = root_ctx;
     state->error = err;
+    state->expr_depth = 0;
 
     if (ALLOC_N(state->value_pool, 8) < 0) {
         STATE_ENOMEM;
