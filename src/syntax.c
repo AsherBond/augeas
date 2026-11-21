@@ -508,8 +508,9 @@ static int lookup_internal(struct augeas *aug, const char *ctx_modname,
             return 0;
         }
     }
-    /* Try to load the module */
-    if (streqv(modname, ctx_modname)) {
+    /* Try to load the module, unless it is the one being compiled; module
+     * names are case-insensitive, like in module_find */
+    if (ctx_modname != NULL && STRCASEEQ(modname, ctx_modname)) {
         free(modname);
         return 0;
     }
@@ -536,7 +537,8 @@ static struct binding *ctx_lookup_bnd(struct info *info,
     struct binding *b = NULL;
     int nlen = strlen(ctx->name);
 
-    if (STREQLEN(ctx->name, name, nlen) && name[nlen] == '.')
+    /* Module names are case-insensitive, like in module_find */
+    if (STRCASEEQLEN(ctx->name, name, nlen) && name[nlen] == '.')
         name += nlen + 1;
 
     b = bnd_lookup(ctx->local, name);
@@ -984,7 +986,9 @@ static struct type *expect_types_arr(struct info *info,
         for (int i=0; i < ntypes; i++) {
             len += strlen(type_name(allowed[i]));
         }
-        len += (ntypes - 1) * 4 + 1;
+        /* Separators are ", " and a final ", or "; allow the longer one
+         * for each, plus the terminating NUL */
+        len += (ntypes - 1) * strlen(", or ") + 1;
         char *allowed_names;
         if (ALLOC_N(allowed_names, len) < 0)
             return NULL;
@@ -1106,6 +1110,9 @@ static int check_compose(struct term *term, struct ctx *ctx) {
             return 0;
         term->type = ref(term->right->type);
     } else {
+        /* The error message mentions the type of the right operand, too */
+        if (! check_exp(term->right, ctx))
+            return 0;
         goto print_error;
     }
     return 1;
@@ -1367,6 +1374,18 @@ static int typecheck(struct term *term, struct augeas *aug) {
 
 static struct value *compile_exp(struct info *, struct term *, struct ctx *);
 
+/* Make a regexp value for R, the result of combining regexps with OP. R is
+ * NULL if that failed; the reason has been reported already, and the
+ * result is an exception rather than a regexp value without a regexp */
+static struct value *regexp_value(struct info *info, struct regexp *r,
+                                  const char *op) {
+    if (r == NULL)
+        return make_exn_value(ref(info), "Regular expression %s failed", op);
+    struct value *v = make_value(V_REGEXP, ref(info));
+    v->regexp = r;
+    return v;
+}
+
 static struct value *compile_union(struct term *exp, struct ctx *ctx) {
     struct value *v1 = compile_exp(exp->info, exp->left, ctx);
     if (EXN(v1))
@@ -1391,8 +1410,8 @@ static struct value *compile_union(struct term *exp, struct ctx *ctx) {
     }
 
     if (t->tag == T_REGEXP) {
-        v = make_value(V_REGEXP, ref(info));
-        v->regexp = regexp_union(info, v1->regexp, v2->regexp);
+        v = regexp_value(info, regexp_union(info, v1->regexp, v2->regexp),
+                         "union 'r1 | r2'");
     } else if (t->tag == T_LENS) {
         struct lens *l1 = v1->lens;
         struct lens *l2 = v2->lens;
@@ -1520,8 +1539,8 @@ static struct value *compile_concat(struct term *exp, struct ctx *ctx) {
         strcpy(s, s1);
         strcat(s, s2);
     } else if (t->tag == T_REGEXP) {
-        v = make_value(V_REGEXP, ref(info));
-        v->regexp = regexp_concat(info, v1->regexp, v2->regexp);
+        v = regexp_value(info, regexp_concat(info, v1->regexp, v2->regexp),
+                         "concatenation 'r1 . r2'");
     } else if (t->tag == T_FILTER) {
         struct filter *f1 = v1->filter;
         struct filter *f2 = v2->filter;
@@ -1627,8 +1646,9 @@ static struct value *compile_rep(struct term *rep, struct ctx *ctx) {
             assert(0);
             abort();
         }
-        v = make_value(V_REGEXP, ref(rep->info));
-        v->regexp = regexp_iter(rep->info, arg->regexp, min, max);
+        v = regexp_value(rep->info,
+                         regexp_iter(rep->info, arg->regexp, min, max),
+                         "repetition");
     } else if (rep->type->tag == T_LENS) {
         int c = LNS_TYPE_CHECK(ctx);
         if (rep->quant == Q_STAR) {
@@ -2009,16 +2029,34 @@ int load_module_file(struct augeas *aug, const char *filename,
     return result;
 }
 
+/* A module whose loading is under way; they form a stack through
+ * AUG->LOADING so that modules that depend on each other are detected
+ * instead of being loaded over and over again */
+struct loading {
+    const char     *name;
+    struct loading *next;
+};
+
 static int load_module(struct augeas *aug, const char *name) {
     char *filename = NULL;
+    struct loading loading = { .name = name, .next = aug->loading };
+    int r;
 
     if (module_find(aug->modules, name) != NULL)
         return 0;
 
+    for (struct loading *l = aug->loading; l != NULL; l = l->next) {
+        if (STRCASEEQ(l->name, name))
+            return -1;
+    }
+
     if ((filename = module_filename(aug, name)) == NULL)
         return -1;
 
-    if (load_module_file(aug, filename, name) == -1)
+    aug->loading = &loading;
+    r = load_module_file(aug, filename, name);
+    aug->loading = loading.next;
+    if (r == -1)
         goto error;
 
     free(filename);

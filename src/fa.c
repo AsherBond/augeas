@@ -67,10 +67,10 @@ int fa_minimization_algorithm = FA_MIN_HOPCROFT;
  */
 struct fa {
     struct state *initial;
-    int           deterministic : 1;
-    int           minimal : 1;
+    unsigned int  deterministic : 1;
+    unsigned int  minimal : 1;
     unsigned int  nocase : 1;
-    int           trans_re : 1;
+    unsigned int  trans_re : 1;
 };
 
 /* A state in a finite automaton. Transitions are never shared between
@@ -118,11 +118,11 @@ static bitset *bitset_init(size_t nbits) {
 }
 
 static inline void bitset_clr(bitset *bs, unsigned int bit) {
-    bs[bit/UINT_BIT] &= ~(1 << (bit % UINT_BIT));
+    bs[bit/UINT_BIT] &= ~(1u << (bit % UINT_BIT));
 }
 
 static inline void bitset_set(bitset *bs, unsigned int bit) {
-    bs[bit/UINT_BIT] |= 1 << (bit % UINT_BIT);
+    bs[bit/UINT_BIT] |= 1u << (bit % UINT_BIT);
 }
 
 ATTRIBUTE_PURE
@@ -213,9 +213,22 @@ struct re_parse {
     const char *rx;          /* Current position in regex */
     const char *rend;        /* Last char of rx+ 1 */
     int         error;       /* error code */
+    /* How deeply parenthesized groups are currently nested */
+    unsigned int nesting;
     /* Whether new CSET's should have the no_ranges flag set */
     unsigned int no_ranges:1;
 };
+
+/* Parsing a regexp, and converting the result into an FA, recurse once
+ * per level of parentheses; limit that to keep the stack from
+ * overflowing. Sequences of concatenations or unions are parsed
+ * iteratively into balanced trees, and do not count towards this limit */
+#define RE_MAX_NESTING 2000
+
+/* The largest count allowed in a repetition like 'r{n,m}'. Each
+ * repetition makes a copy of the FA for 'r', and large counts are an easy
+ * way to exhaust memory and time. RE2 uses the same limit */
+#define RE_MAX_REPEAT 1000
 
 /* String with explicit length, used when converting re to string */
 struct re_str {
@@ -224,6 +237,12 @@ struct re_str {
 };
 
 static struct re *parse_regexp(struct re_parse *parse);
+static int re_binop_count(enum re_type type, const struct re *re);
+static int re_binop_store(enum re_type type, const struct re *re,
+                          const struct re **list);
+static struct re *parse_toplevel(struct re_parse *parse,
+                                 const char *regexp, size_t len,
+                                 bool no_ranges);
 
 /* A map from a set of states to a state. */
 typedef hash_t state_set_hash;
@@ -2212,7 +2231,8 @@ struct fa *fa_iter(struct fa *fa, int min, int max) {
 
 static void sort_transition_intervals(struct fa *fa) {
     list_for_each(s, fa->initial) {
-        qsort(s->trans, s->tused, sizeof(*s->trans), trans_intv_cmp);
+        if (s->tused > 0)
+            qsort(s->trans, s->tused, sizeof(*s->trans), trans_intv_cmp);
     }
 }
 
@@ -3066,13 +3086,37 @@ static struct fa *fa_from_re(struct re *re) {
         break;
     case CONCAT:
         {
-            result = fa_from_re(re->exp1);
+            /* concat_in_place walks all states of its first argument.
+             * Flatten the chain of concatenations and concatenate from
+             * right to left so that the first argument is always small.
+             * Build the pieces from left to right though, since states
+             * that are allocated in the order in which they appear in
+             * the result make collect() noticeably faster */
+            int n = re_binop_count(CONCAT, re);
+            const struct re **list = NULL;
+            struct fa **fas = NULL;
+
+            if (ALLOC_N(list, n) < 0 || ALLOC_N(fas, n) < 0) {
+                free(list);
+                goto error;
+            }
+            re_binop_store(CONCAT, re, list);
+            int ok = 1;
+            for (int i = 0; i < n && ok; i++) {
+                fas[i] = fa_from_re((struct re *) list[i]);
+                ok = fas[i] != NULL;
+            }
+            for (int i = n - 2; i >= 0 && ok; i--)
+                ok = concat_in_place(fas[i], &fas[i+1]) == 0;
+            if (ok) {
+                result = fas[0];
+            } else {
+                for (int i = 0; i < n; i++)
+                    fa_free(fas[i]);
+            }
+            free(fas);
+            free(list);
             if (result == NULL)
-                goto error;
-            struct fa *fa2 = fa_from_re(re->exp2);
-            if (fa2 == NULL)
-                goto error;
-            if (concat_in_place(result, &fa2) < 0)
                 goto error;
         }
         break;
@@ -3126,11 +3170,7 @@ int fa_compile(const char *regexp, size_t size, struct fa **fa) {
 
     *fa = NULL;
 
-    parse.rx = regexp;
-    parse.rend = regexp + size;
-    parse.error = REG_NOERROR;
-
-    re = parse_regexp(&parse);
+    re = parse_toplevel(&parse, regexp, size, false);
     if (re == NULL)
         return parse.error;
 
@@ -3381,7 +3421,13 @@ static struct re *parse_simple_exp(struct re_parse *parse) {
                 goto error;
             }
         } else {
+            if (parse->nesting >= RE_MAX_NESTING) {
+                parse->error = REG_ESIZE;
+                goto error;
+            }
+            parse->nesting += 1;
             re = parse_regexp(parse);
+            parse->nesting -= 1;
             if (re == NULL)
                 goto error;
             if (! match(parse, ')')) {
@@ -3471,9 +3517,12 @@ static struct re *parse_repeated_exp(struct re_parse *parse) {
         if (min == -1)
             goto error;
         if (match(parse, ',')) {
+            /* A missing upper bound, as in 'r{2,}', makes parse_int
+             * return -1, which means 'unbounded'; a bad one, e.g. one
+             * that is too large, sets an error */
             max = parse_int(parse);
-            if (max == -1)
-                max = -1;      /* If it's not an int, it means 'unbounded' */
+            if (parse->error != REG_NOERROR)
+                goto error;
             if (! match(parse, '}')) {
                 parse->error = REG_EBRACE;
                 goto error;
@@ -3488,6 +3537,10 @@ static struct re *parse_repeated_exp(struct re_parse *parse) {
             parse->error = REG_BADBR;
             goto error;
         }
+        if (min > RE_MAX_REPEAT || max > RE_MAX_REPEAT) {
+            parse->error = REG_ESIZE;
+            goto error;
+        }
         re = make_re_rep(re, min, max);
     }
     if (re == NULL)
@@ -3498,62 +3551,146 @@ static struct re *parse_repeated_exp(struct re_parse *parse) {
     return NULL;
 }
 
-static struct re *parse_concat_exp(struct re_parse *parse) {
-    struct re *re = parse_repeated_exp(parse);
-    if (re == NULL)
-        goto error;
+/* Combine the N regexps in RES into a balanced tree of TYPE nodes. Since
+ * CONCAT and UNION are associative, the shape of the tree does not
+ * matter, but keeping it balanced keeps its depth logarithmic in N.
+ * Consumes the references in RES, even on failure */
+static struct re *make_re_balanced(enum re_type type, struct re **res,
+                                   size_t n) {
+    if (n == 1)
+        return res[0];
 
-    if (more(parse) && ! peek(parse, ")|")) {
-        struct re *re2 = parse_concat_exp(parse);
-        if (re2 == NULL)
+    size_t mid = n / 2;
+    struct re *left = make_re_balanced(type, res, mid);
+    if (left == NULL) {
+        for (size_t i = mid; i < n; i++)
+            re_unref(res[i]);
+        return NULL;
+    }
+    struct re *right = make_re_balanced(type, res + mid, n - mid);
+    if (right == NULL) {
+        re_unref(left);
+        return NULL;
+    }
+    return make_re_binop(type, left, right);
+}
+
+/* A growable list of regexps, used while parsing sequences of
+ * concatenations or unions */
+struct re_list {
+    struct re **res;
+    size_t      used;
+    size_t      size;
+};
+
+static int re_list_append(struct re_list *list, struct re *re) {
+    if (list->used >= list->size) {
+        size_t size = list->size == 0 ? 8 : 2 * list->size;
+        if (REALLOC_N(list->res, size) < 0)
+            return -1;
+        list->size = size;
+    }
+    list->res[list->used++] = re;
+    return 0;
+}
+
+static void re_list_free(struct re_list *list) {
+    for (size_t i = 0; i < list->used; i++)
+        re_unref(list->res[i]);
+    free(list->res);
+}
+
+/* Turn LIST into a balanced tree of TYPE nodes and free LIST */
+static struct re *re_list_combine(struct re_parse *parse,
+                                  enum re_type type, struct re_list *list) {
+    struct re *re = make_re_balanced(type, list->res, list->used);
+    free(list->res);
+    if (re == NULL)
+        parse->error = REG_ESPACE;
+    return re;
+}
+
+static struct re *parse_concat_exp(struct re_parse *parse) {
+    struct re_list list = { NULL, 0, 0 };
+
+    do {
+        struct re *re = parse_repeated_exp(parse);
+        if (re == NULL)
             goto error;
-        re = make_re_binop(CONCAT, re, re2);
-        if (re == NULL) {
+        if (re_list_append(&list, re) < 0) {
+            re_unref(re);
             parse->error = REG_ESPACE;
             goto error;
         }
-    }
-    return re;
+    } while (more(parse) && ! peek(parse, ")|"));
+
+    return re_list_combine(parse, CONCAT, &list);
 
  error:
-    re_unref(re);
+    re_list_free(&list);
     return NULL;
 }
 
 static struct re *parse_regexp(struct re_parse *parse) {
-    struct re *re = NULL;
+    struct re_list list = { NULL, 0, 0 };
 
-    /* Something like (|r) */
-    if (peek(parse, "|"))
-        re = make_re(EPSILON);
-    else
-        re = parse_concat_exp(parse);
-    if (re == NULL)
-        goto error;
-
-    if (match(parse, '|')) {
-        struct re *re2 = NULL;
-        /* Something like (r|) */
-        if (peek(parse, ")"))
-            re2 = make_re(EPSILON);
+    while (1) {
+        struct re *re = NULL;
+        /* Something like (|r) */
+        if (peek(parse, "|"))
+            re = make_re(EPSILON);
         else
-            re2 = parse_regexp(parse);
-        if (re2 == NULL)
+            re = parse_concat_exp(parse);
+        if (re == NULL)
             goto error;
-
-        re = make_re_binop(UNION, re, re2);
-        if (re == NULL) {
+        if (re_list_append(&list, re) < 0) {
+            re_unref(re);
             parse->error = REG_ESPACE;
             goto error;
         }
+
+        if (! match(parse, '|'))
+            break;
+        /* Something like (r|) */
+        if (peek(parse, ")")) {
+            re = make_re(EPSILON);
+            if (re == NULL || re_list_append(&list, re) < 0) {
+                re_unref(re);
+                parse->error = REG_ESPACE;
+                goto error;
+            }
+            break;
+        }
     }
-    return re;
+
+    return re_list_combine(parse, UNION, &list);
 
  error:
-    if (re == NULL && parse->error == REG_NOERROR)
+    if (parse->error == REG_NOERROR)
         parse->error = _REG_ENOSYS;
-    re_unref(re);
+    re_list_free(&list);
     return NULL;
+}
+
+/* Parse the regexp REGEXP of length LEN. Return NULL and set
+ * PARSE->ERROR if parsing fails */
+static struct re *parse_toplevel(struct re_parse *parse,
+                                 const char *regexp, size_t len,
+                                 bool no_ranges) {
+    MEMZERO(parse, 1);
+    parse->rx = regexp;
+    parse->rend = regexp + len;
+    parse->error = REG_NOERROR;
+    parse->no_ranges = no_ranges;
+
+    struct re *re = parse_regexp(parse);
+    if (parse->error != REG_NOERROR) {
+        re_unref(re);
+        return NULL;
+    }
+    if (re == NULL)
+        parse->error = _REG_ENOSYS;
+    return re;
 }
 
 /*
@@ -4334,12 +4471,8 @@ int fa_restrict_alphabet(const char *regexp, size_t regexp_len,
     struct re_str str;
 
     *newregexp = NULL;
-    MEMZERO(&parse, 1);
-    parse.rx = regexp;
-    parse.rend = regexp + regexp_len;
-    parse.error = REG_NOERROR;
-    re = parse_regexp(&parse);
-    if (parse.error != REG_NOERROR)
+    re = parse_toplevel(&parse, regexp, regexp_len, false);
+    if (re == NULL)
         return parse.error;
 
     result = re_restrict_alphabet(re, from, to);
@@ -4365,13 +4498,8 @@ int fa_expand_char_ranges(const char *regexp, size_t regexp_len,
     struct re_str str;
 
     *newregexp = NULL;
-    MEMZERO(&parse, 1);
-    parse.rx = regexp;
-    parse.rend = regexp + regexp_len;
-    parse.error = REG_NOERROR;
-    parse.no_ranges = 1;
-    re = parse_regexp(&parse);
-    if (parse.error != REG_NOERROR)
+    re = parse_toplevel(&parse, regexp, regexp_len, true);
+    if (re == NULL)
         return parse.error;
 
     MEMZERO(&str, 1);
@@ -4444,12 +4572,8 @@ int fa_expand_nocase(const char *regexp, size_t regexp_len,
     struct re_str str;
 
     *newregexp = NULL;
-    MEMZERO(&parse, 1);
-    parse.rx = regexp;
-    parse.rend = regexp + regexp_len;
-    parse.error = REG_NOERROR;
-    re = parse_regexp(&parse);
-    if (parse.error != REG_NOERROR)
+    re = parse_toplevel(&parse, regexp, regexp_len, false);
+    if (re == NULL)
         return parse.error;
 
     r = re_case_expand(re);

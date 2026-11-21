@@ -282,7 +282,12 @@ char *regexp_expand_nocase(struct regexp *r) {
      * of its children have groups that are in direct relation */
     for (t = p; *t; t++) if (*t == '(') psub += 1;
     for (t = s; *t; t++) if (*t == '(') rsub += 1;
-    BUG_ON(psub < rsub, r->info, NULL);
+    /* The expansion can have more groups than the original, e.g. 'm|'
+     * becomes '[Mm]|()', and we can not make up for that. User input can
+     * get us here, so it is an error and not a bug */
+    ERR_THROW(psub < rsub, r->info, AUG_ESYNTAX,
+              "the case-insensitive regexp /%s/i can not be combined with "
+              "case-sensitive regexps", p);
     psub -= rsub;
     if (psub > 0) {
         char *adjusted = NULL, *a;
@@ -558,9 +563,16 @@ static int regexp_compile_internal(struct regexp *r, const char **c) {
     *c = re_compile_pattern(r->pattern->str, strlen(r->pattern->str), r->re);
     re_syntax_options = old_syntax;
 
-    r->re->regs_allocated = REGS_REALLOCATE;
-    if (*c != NULL)
+    if (*c != NULL) {
+        /* Do not keep the pattern buffer around after a failed compile:
+         * regexp_match only compiles R when R->RE is NULL, and would
+         * otherwise match against this unusable buffer the next time
+         * around */
+        regfree(r->re);
+        FREE(r->re);
         return -1;
+    }
+    r->re->regs_allocated = REGS_REALLOCATE;
     return 0;
 }
 

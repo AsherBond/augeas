@@ -530,6 +530,9 @@ static void testNoTerminator(CuTest *tc) {
         { "a|",   REG_NOERROR },
         { "a|b|", REG_NOERROR },
         { "(",    REG_EPAREN  },
+        { "(|",   REG_EPAREN  },
+        { "[",    REG_EBRACK  },
+        { "[]",   REG_EBRACK  },
     };
     for (int i=0; i < ARRAY_CARDINALITY(cases); i++) {
         size_t len = strlen(cases[i].rx);
@@ -545,6 +548,11 @@ static void testNoTerminator(CuTest *tc) {
             fa_free(fa);
         free(rx);
     }
+
+    /* Only the first LEN characters are part of the regexp */
+    struct fa *fa1 = make_fa(tc, "a|)", 2, REG_NOERROR);
+    struct fa *fa2 = make_good_fa(tc, "a?");
+    CuAssertTrue(tc, fa_equals(fa1, fa2));
 }
 
 static void testRestrictAlphabet(CuTest *tc) {
@@ -712,6 +720,94 @@ static void testEnumerate(CuTest *tc) {
     free_words(10, words);
 }
 
+/* Characters whose bit is the top bit of a word in a bitset. Setting
+ * or clearing them used to shift a signed 1 into the sign bit, which is
+ * undefined behavior (oss-fuzz 42512600, 42512479) */
+static void testCharsetSignBit(CuTest *tc) {
+    struct fa *fa1 = make_good_fa(tc, "[\x1f?_\x7f]");
+    struct fa *fa2 = make_good_fa(tc, "\x1f|\\?|_|\x7f");
+    struct fa *neg1 = make_good_fa(tc, "[^?_]");
+    struct fa *neg2 = make_good_fa(tc, "[^_?]");
+
+    CuAssertTrue(tc, fa_equals(fa1, fa2));
+    CuAssertTrue(tc, fa_equals(neg1, neg2));
+    CuAssertTrue(tc, ! fa_contains(fa1, neg1));
+}
+
+/* Return a string with PREFIX, N copies of OPEN, MIDDLE, N copies of
+ * CLOSE */
+static char *repeat_str(const char *prefix, const char *open,
+                        const char *middle, const char *close, int n) {
+    size_t len = strlen(prefix) + strlen(middle)
+        + n * (strlen(open) + strlen(close)) + 1;
+    char *s = malloc(len), *p;
+
+    if (s == NULL)
+        die_oom();
+    p = stpcpy(s, prefix);
+    for (int i=0; i < n; i++)
+        p = stpcpy(p, open);
+    p = stpcpy(p, middle);
+    for (int i=0; i < n; i++)
+        p = stpcpy(p, close);
+    return s;
+}
+
+/* Long regexps must not make the parser recurse once per character, and
+ * nesting of parentheses is limited (oss-fuzz 42516515, 42512958,
+ * 42512599, 385424162, 478376808) */
+static void testLongRegexps(CuTest *tc) {
+    struct fa *fa, *exp;
+    char *rx;
+
+    rx = repeat_str("", "a", "", "", 5000);
+    fa = make_fa(tc, rx, strlen(rx), REG_NOERROR);
+    exp = make_good_fa(tc, "(a{1000}){5}");
+    CuAssertTrue(tc, fa_equals(fa, exp));
+    free(rx);
+
+    rx = repeat_str("a", "|a", "", "", 100000);
+    fa = make_fa(tc, rx, strlen(rx), REG_NOERROR);
+    exp = make_good_fa(tc, "a");
+    CuAssertTrue(tc, fa_equals(fa, exp));
+    free(rx);
+
+    rx = repeat_str("", "(", "a", ")", 500);
+    fa = make_fa(tc, rx, strlen(rx), REG_NOERROR);
+    CuAssertTrue(tc, fa_equals(fa, exp));
+    free(rx);
+
+    rx = repeat_str("", "(", "a", ")", 100000);
+    make_fa(tc, rx, strlen(rx), REG_ESIZE);
+    free(rx);
+}
+
+/* Errors in bounds of repetitions must be reported and not leak
+ * memory (oss-fuzz 42512434, 518254815) */
+static void testBadRepetition(CuTest *tc) {
+    static const char *const bad = "S{5566,-30686839221807436668}";
+    char *s = NULL;
+    size_t len;
+    int r;
+
+    make_fa(tc, bad, strlen(bad), REG_BADBR);
+    make_fa(tc, "a{2,99999999999}", strlen("a{2,99999999999}"), REG_BADBR);
+
+    r = fa_expand_nocase(bad, strlen(bad), &s, &len);
+    CuAssertIntEquals(tc, REG_BADBR, r);
+    CuAssertPtrEquals(tc, NULL, s);
+}
+
+/* Counts in repetitions are limited to 1000 (oss-fuzz 42512581,
+ * 435225513, 42512748) */
+static void testRepetitionLimit(CuTest *tc) {
+    make_good_fa(tc, "a{1000}");
+    make_good_fa(tc, "a{0,1000}");
+    make_fa(tc, "a{1001}", strlen("a{1001}"), REG_ESIZE);
+    make_fa(tc, "a{2,1001}", strlen("a{2,1001}"), REG_ESIZE);
+    make_fa(tc, "a{1001,}", strlen("a{1001,}"), REG_ESIZE);
+}
+
 int main(int argc, char **argv) {
     if (argc == 1) {
         char *output = NULL;
@@ -740,6 +836,10 @@ int main(int argc, char **argv) {
         SUITE_ADD_TEST(suite, testExpandNoCase);
         SUITE_ADD_TEST(suite, testNoCaseComplement);
         SUITE_ADD_TEST(suite, testEnumerate);
+        SUITE_ADD_TEST(suite, testCharsetSignBit);
+        SUITE_ADD_TEST(suite, testLongRegexps);
+        SUITE_ADD_TEST(suite, testBadRepetition);
+        SUITE_ADD_TEST(suite, testRepetitionLimit);
 
         CuSuiteRun(suite);
         CuSuiteSummary(suite, &output);

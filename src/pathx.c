@@ -31,8 +31,6 @@
 #include "regexp.h"
 #include "errcode.h"
 
-#define MAX_EXPR_DEPTH 100
-
 static const char *const errcodes[] = {
     "no error",
     "empty name",
@@ -52,8 +50,23 @@ static const char *const errcodes[] = {
     "wrong number of arguments in function call", /* PATHX_EARITY */
     "invalid regular expression",                 /* PATHX_EREGEXP */
     "too many matches",                           /* PATHX_EMMATCH */
-    "wrong flag for regexp"                       /* PATHX_EREGEXPFLAG */
+    "wrong flag for regexp",                      /* PATHX_EREGEXPFLAG */
+    "expression nested too deeply"               /* PATHX_EDEPTH */
 };
+
+/* Parsing, typechecking, evaluating and freeing path expressions all
+ * recurse over the syntax tree, and the limits below keep that recursion
+ * from exhausting the stack.
+ *
+ * MAX_EXPR_DEPTH limits how deeply parentheses, predicates and function
+ * arguments can be nested; the parser recurses about a dozen frames
+ * for each level.
+ *
+ * MAX_HEIGHT limits the height of the syntax tree. Chains of binary
+ * operators like 'a|b|c' are parsed iteratively, but produce trees whose
+ * height grows with the length of the chain */
+#define MAX_EXPR_DEPTH 100
+#define MAX_HEIGHT 1000
 
 /*
  * Path expressions are strings that use a notation modelled on XPath.
@@ -197,6 +210,7 @@ struct value {
 struct expr {
     enum expr_tag tag;
     enum type     type;
+    unsigned int  height;  /* Height of the syntax tree rooted here */
     union {
         struct {                       /* E_FILTER */
             struct expr     *primary;
@@ -254,6 +268,9 @@ struct state {
     struct value  *value_pool;
     value_ind_t    value_pool_used;
     value_ind_t    value_pool_size;
+    /* Values below this index must survive evaluation because constant
+     * folding made an expression refer to them */
+    value_ind_t    value_pool_pinned;
     /* Stack of values (as indices into value_pool), with bottom of
        stack in values[0] */
     value_ind_t   *values;
@@ -520,8 +537,10 @@ static void ns_add(struct nodeset *ns, struct tree *node,
     if (ns->used >= ns->size) {
         size_t size = 2 * ns->size;
         if (size < 10) size = 10;
-        if (REALLOC_N(ns->nodes, size) < 0)
+        if (REALLOC_N(ns->nodes, size) < 0) {
             STATE_ENOMEM;
+            return;
+        }
         ns->size = size;
     }
     ns->nodes[ns->used] = node;
@@ -944,21 +963,27 @@ static void eval_arith(struct state *state, enum binary_op op) {
     value_ind_t vind = make_value(T_NUMBER, state);
     struct value *r = pop_value(state);
     struct value *l = pop_value(state);
-    int res;
+    int64_t res;
+    bool overflow;
+
+    RET_ON_ERROR;
 
     assert(l->tag == T_NUMBER);
     assert(r->tag == T_NUMBER);
 
-    RET_ON_ERROR;
-
     if (op == OP_PLUS)
-        res = l->number + r->number;
+        overflow = __builtin_add_overflow(l->number, r->number, &res);
     else if (op == OP_MINUS)
-        res = l->number - r->number;
+        overflow = __builtin_sub_overflow(l->number, r->number, &res);
     else if (op == OP_STAR)
-        res = l->number * r->number;
+        overflow = __builtin_mul_overflow(l->number, r->number, &res);
     else
         assert(0);
+
+    if (overflow) {
+        STATE_ERROR(state, PATHX_ENUMBER);
+        return;
+    }
 
     state->value_pool[vind].number = res;
     push_value(vind, state);
@@ -1087,6 +1112,9 @@ static void eval_union(struct state *state, struct locpath_trace *lpt_right) {
 
     res = clone_nodeset(l->nodeset, state);
     RET_ON_ERROR;
+    /* Mark the nodes from L so that ns_add does not add them again */
+    for (int i=0; i < res->used; i++)
+        res->nodes[i]->added = 1;
     for (int i=0; i < r->nodeset->used; i++) {
         ns_add(res, r->nodeset->nodes[i], state);
         if (HAS_ERROR(state))
@@ -1235,24 +1263,49 @@ static void eval_app(struct expr *expr, struct state *state) {
     expr->func->impl(state, expr->func->arity);
 }
 
+/* Release all values that were added to the value pool at or after
+ * index MARK, except for pinned ones. Only safe when nothing on the value
+ * stack refers to them anymore */
+static void release_values(struct state *state, value_ind_t mark) {
+    if (mark < state->value_pool_pinned)
+        mark = state->value_pool_pinned;
+    if (mark >= state->value_pool_used)
+        return;
+    for (value_ind_t i = mark; i < state->value_pool_used; i++)
+        release_value(state->value_pool + i);
+    state->value_pool_used = mark;
+}
+
 static bool eval_pred(struct expr *expr, struct state *state) {
+    value_ind_t mark = state->value_pool_used;
+    bool result;
+
     eval_expr(expr, state);
     RET0_ON_ERROR;
 
     struct value *v = pop_value(state);
     switch(v->tag) {
     case T_BOOLEAN:
-        return v->boolval;
+        result = v->boolval;
+        break;
     case T_NUMBER:
-        return (state->ctx_pos == v->number);
+        result = (state->ctx_pos == v->number);
+        break;
     case T_NODESET:
-        return v->nodeset->used > 0;
+        result = v->nodeset->used > 0;
+        break;
     case T_STRING:
-        return streqv(state->ctx->value, v->string);
+        result = streqv(state->ctx->value, v->string);
+        break;
     default:
         assert(0);
         return false;
     }
+    /* The predicate is evaluated once for every node it is applied to;
+     * without releasing the values it produced, the value pool would grow
+     * with the number of times it is evaluated */
+    release_values(state, mark);
+    return result;
 }
 
 /* Remove COUNT successive entries from NS. The first entry to remove is at
@@ -1521,6 +1574,8 @@ static void eval_expr(struct expr *expr, struct state *state) {
             value_ind_t vind = state->values_used - 1;
             expr->tag = E_VALUE;
             expr->value_ind = state->values[vind];
+            if (expr->value_ind >= state->value_pool_pinned)
+                state->value_pool_pinned = expr->value_ind + 1;
         }
         break;
     default:
@@ -1805,7 +1860,54 @@ static struct expr* pop_expr(struct state *state) {
     }
 }
 
+static unsigned int max_height(unsigned int h1, unsigned int h2) {
+    return h1 > h2 ? h1 : h2;
+}
+
+static unsigned int pred_height(const struct pred *pred) {
+    unsigned int h = 0;
+    if (pred == NULL)
+        return 0;
+    for (int i=0; i < pred->nexpr; i++)
+        h = max_height(h, pred->exprs[i]->height);
+    return h;
+}
+
+/* Set the height of EXPR from the heights of its children, which have
+ * all been pushed, and therefore had their height set, before EXPR */
+static void set_height(struct expr *expr, struct state *state) {
+    unsigned int h = 0;
+
+    switch (expr->tag) {
+    case E_FILTER:
+        if (expr->primary != NULL)
+            h = expr->primary->height;
+        h = max_height(h, pred_height(expr->predicates));
+        if (expr->locpath != NULL) {
+            list_for_each(step, expr->locpath->steps)
+                h = max_height(h, pred_height(step->predicates));
+        }
+        break;
+    case E_BINARY:
+        h = max_height(expr->left->height, expr->right->height);
+        break;
+    case E_VALUE:
+    case E_VAR:
+        break;
+    case E_APP:
+        for (int i=0; i < expr->func->arity; i++)
+            h = max_height(h, expr->args[i]->height);
+        break;
+    default:
+        assert(0);
+    }
+    expr->height = h + 1;
+    if (expr->height > MAX_HEIGHT)
+        STATE_ERROR(state, PATHX_EDEPTH);
+}
+
 static void push_expr(struct expr *expr, struct state *state) {
+    set_height(expr, state);
     if (state->exprs_used >= state->exprs_size) {
         size_t new_size = 2*state->exprs_size;
         if (new_size == 0) new_size = 8;
@@ -2586,7 +2688,7 @@ static void parse_else_expr(struct state *state) {
 static void parse_expr(struct state *state) {
     skipws(state);
     if (state->expr_depth >= MAX_EXPR_DEPTH) {
-        STATE_ERROR(state, PATHX_EPAREN);
+        STATE_ERROR(state, PATHX_EDEPTH);
         return;
     }
     state->expr_depth += 1;
@@ -2748,6 +2850,10 @@ static bool step_matches(struct step *step, struct tree *tree) {
 
 static struct tree *tree_prev(struct tree *pos) {
     struct tree *node = NULL;
+    /* The origin is its own parent, but not one of its own children,
+     * and therefore has no siblings */
+    if (pos->parent == pos)
+        return NULL;
     if (pos != pos->parent->children) {
         for (node = pos->parent->children;
              node->next != pos;

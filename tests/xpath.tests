@@ -279,6 +279,15 @@ test union (/files/etc/yum.conf | /files/etc/yum.repos.d/*)/*/gpgcheck
      /files/etc/yum.repos.d/remi.repo/remi/gpgcheck = 1
      /files/etc/yum.repos.d/remi.repo/remi-test/gpgcheck = 1
 
+# A node that is in both operands appears only once in a union
+test union_dedup /files/etc/hosts/1 | /files/etc/hosts/*
+     /files/etc/hosts/1
+     /files/etc/hosts/#comment[1] = ...
+     /files/etc/hosts/#comment[2] = ...
+     /files/etc/hosts/#comment[3] = ...
+     /files/etc/hosts/#comment[4] = ...
+     /files/etc/hosts/2
+
 test else_nodeset_lhs (/files/etc/yum.conf else /files/etc/yum.repos.d/*)/*/gpgcheck
      /files/etc/yum.conf/main/gpgcheck = 1
 
@@ -323,6 +332,10 @@ test int-ns-lt /files/etc/group/*[int(gid) < 3]
 test int-bool-f /files[int(1 = 0) > 0]
 
 test int-bool-t /files[int(1 = 1) > 0]
+     /files
+
+# Arithmetic uses the full 64 bits of numbers
+test int-64bit /files[int('3000000000') + 1 = int('3000000001')]
      /files
 
 # Relative paths, relying on default /files context
@@ -384,6 +397,13 @@ test else_chain2 /files/etc/fstab/*[passno='9' else passno='8' else passno='2']/
      /files/etc/fstab/5/file = /home
      /files/etc/fstab/8/file = /local
      /files/etc/fstab/9/file = /var/lib/xen/images
+
+# A union chain on the left of a nodeset 'else' leaves the value pool full
+# right before 'else' produces its result. eval_else used to allocate that
+# result after popping its operands, and read them from the old pool after
+# it was reallocated (github #853)
+test else_nodeset_realloc (/files/etc/fstab/1|/files/etc/fstab/1|/files/etc/fstab/1 else /files/etc/fstab/2)/file
+     /files/etc/fstab/1/file = /
 
 # Although there are nodes matching passno=2 and nodes matching dump=0
 # there is no node with both

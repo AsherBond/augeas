@@ -44,7 +44,11 @@ static const int ntypes = sizeof(type_offs)/sizeof(type_offs[0]);
 static const char *lens_type_names[] =
     { "ctype", "atype", "ktype", "vtype" };
 
-#define ltype(lns, t) *((struct regexp **) ((char *) lns + type_offs[t]))
+/* The lens field at offset type_offs[t] as an lvalue. The offsets come from
+ * offsetof, so the result is properly aligned; going through void * tells
+ * the compiler as much and keeps -Wcast-align quiet. */
+#define ltype(lns, t)                                                   \
+    *((struct regexp **) (void *) ((char *) (lns) + type_offs[t]))
 
 static struct value * typecheck_union(struct info *,
                                       struct lens *l1, struct lens *l2);
@@ -1899,7 +1903,9 @@ static struct regexp *rtn_reduce(struct rtn *rtn, struct lens *rec) {
     /* Eliminate epsilon transitions and turn transitions between the same
      * two states into a regexp union */
     list_for_each(s, rtn->states) {
-        qsort(s->trans, s->ntrans, sizeof(*s->trans), trans_to_cmp);
+        /* s->trans is NULL for states without transitions */
+        if (s->ntrans > 0)
+            qsort(s->trans, s->ntrans, sizeof(*s->trans), trans_to_cmp);
         for (int i=0; i < s->ntrans; i++) {
             int j = i+1;
             for (;j < s->ntrans && s->trans[i].to == s->trans[j].to;
